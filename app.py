@@ -19,10 +19,10 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# Automatické načtení klíče ze Streamlit Secrets
+# Načtení API klíče
 api_key = st.secrets.get("GEMINI_API_KEY", "")
 
-# Inicializace stavu
+# Inicializace paměti
 if "validation_score" not in st.session_state: st.session_state.validation_score = 0
 if "canvas" not in st.session_state: 
     st.session_state.canvas = {
@@ -37,8 +37,6 @@ with st.sidebar:
     st.title("🚀 Startup Hub")
     if not api_key:
         api_key = st.text_input("Vložte záložní Gemini API Key:", type="password")
-    else:
-        st.success("🤖 AI Engine: Aktivní a připraven")
     
     st.divider()
     st.markdown("### 📊 Validation Score")
@@ -62,10 +60,18 @@ if not api_key:
     st.warning("Systém nemá nastaven Gemini API klíč v Secrets. Zadejte jej v postranním panelu.")
     st.stop()
 
-# Připojení k AI
+# Automatická volba dostupného modelu
 try:
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    dostupne_modely = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+    
+    # Prioritní výběr: Flash -> Pro -> cokoliv dostupného
+    vybrany_model_nazev = next(
+        (m for m in dostupne_modely if "flash" in m.lower()),
+        next((m for m in dostupne_modely if "pro" in m.lower()), dostupne_modely[0] if dostupne_modely else "gemini-pro")
+    )
+    model = genai.GenerativeModel(vybrany_model_nazev)
+    st.sidebar.caption(f"Aktivní AI Model: `{vybrany_model_nazev.replace('models/', '')}`")
 except Exception as e:
     st.error(f"Chyba při připojení k AI: {e}")
     st.stop()
@@ -125,8 +131,8 @@ with tab_mentor:
                 Aktuální Skóre (0-100): {st.session_state.validation_score}
                 Zpráva od studenta: {user_input}
                 
-                POKYN: Odpověz VÝHRADNĚ v čistém formátu JSON! Nechci žádný jiný text před ani za JSONem (ani markdown bloky ```json).
-                Struktura JSONu musí být přesně takto:
+                POKYN: Odpověz VÝHRADNĚ v čistém formátu JSON! Nechci žádný jiný text před ani za JSONem.
+                Struktura JSONu:
                 {{
                     "odpoved_mentora": "Tvá přísná odpověď...",
                     "nove_skore": 45,
@@ -142,18 +148,21 @@ with tab_mentor:
                     try:
                         response = model.generate_content(prompt)
                         raw_text = response.text.strip()
-                        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+                        raw_text = re.sub(r'^```json\s*', '', raw_text)
+                        raw_text = re.sub(r'\s*```$', '', raw_text)
                         
-                        ai_data = json.loads(raw_text)
-                        
-                        st.session_state.mentor_history.append({"role": "mentor", "content": ai_data.get("odpoved_mentora", "Bez komentáře.")})
-                        st.session_state.validation_score = ai_data.get("nove_skore", st.session_state.validation_score)
-                        
-                        new_canvas = ai_data.get("canvas_updaty", {})
-                        for k in st.session_state.canvas.keys():
-                            if k in new_canvas and new_canvas[k]: 
-                                st.session_state.canvas[k] = new_canvas[k]
-                                
+                        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+                        if match:
+                            ai_data = json.loads(match.group(0))
+                            st.session_state.mentor_history.append({"role": "mentor", "content": ai_data.get("odpoved_mentora", "Bez komentáře.")})
+                            st.session_state.validation_score = ai_data.get("nove_skore", st.session_state.validation_score)
+                            
+                            new_canvas = ai_data.get("canvas_updaty", {})
+                            for k in st.session_state.canvas.keys():
+                                if k in new_canvas and new_canvas[k]: 
+                                    st.session_state.canvas[k] = new_canvas[k]
+                        else:
+                            st.session_state.mentor_history.append({"role": "mentor", "content": raw_text})
                     except Exception as e:
                         st.session_state.mentor_history.append({"role": "mentor", "content": f"Omlouvám se, něco se pokazilo. Zkus to napsat znovu. (Technická chyba: {str(e)})"})
                 st.rerun()
@@ -229,8 +238,5 @@ with tab_krize:
                         try:
                             response_res = model.generate_content(prompt_reseni)
                             st.info(response_res.text)
-                            if st.button("Ukončit krizi"):
-                                st.session_state.krize_aktivni = None
-                                st.rerun()
                         except:
                             st.error("Chyba při vyhodnocování.")
