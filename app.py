@@ -2,6 +2,10 @@ import streamlit as st
 import json
 import re
 import requests
+import base64
+import zipfile
+import xml.etree.ElementTree as ET
+import io
 
 st.set_page_config(page_title="AI Lean Startup", page_icon="🚀", layout="wide")
 
@@ -16,11 +20,14 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; }
 .chat-mentor { background: #f0fdf4; padding: 15px; border-radius: 12px; border-left: 5px solid #22c55e; margin-bottom: 10px; color: #0f172a; }
 .chat-user { background: #f1f5f9; padding: 15px; border-radius: 12px; margin-bottom: 10px; text-align: right; color: #334155; }
 .crisis-box { background: rgba(239, 68, 68, 0.1); border: 2px solid #ef4444; padding: 20px; border-radius: 12px; color: #991b1b; font-weight: 600; font-size: 1.1em;}
+.file-badge { background: #e2e8f0; padding: 4px 8px; border-radius: 6px; font-size: 0.85em; font-weight: 600; color: #475569; display: inline-block; margin-bottom: 6px;}
 </style>
 """, unsafe_allow_html=True)
 
+# Načtení API klíče ze Streamlit Secrets
 api_key = st.secrets.get("GEMINI_API_KEY", "") or st.secrets.get("AI_API_KEY", "")
 
+# Inicializace stavu
 if "validation_score" not in st.session_state: st.session_state.validation_score = 0
 if "canvas" not in st.session_state: 
     st.session_state.canvas = {
@@ -50,7 +57,7 @@ with st.sidebar:
     if st.session_state.validation_score == 0:
         st.info("Představte svůj nápad mentorovi v záložce 2.")
     elif st.session_state.validation_score < 40:
-        st.warning("Fáze: Hledání Problem-Solution Fit. Ověřte problém u reálných uživatelů.")
+        st.warning("Fáze: Hledání Problem-Solution Fit. Ověřte problém u zákazníků.")
     elif st.session_state.validation_score < 75:
         st.info("Fáze: Příprava MVP a pilotního testování.")
     else:
@@ -62,35 +69,91 @@ if not api_key:
     st.warning("Systém nemá nastaven API klíč. Zadejte jej v postranním panelu.")
     st.stop()
 
-def call_ai_direct_rest(prompt_text):
+# =========================================================================
+# FUNKCE PRO EXTRAKCI TEXTU A PŘÍPRAVU PŘÍLOH
+# =========================================================================
+def extract_text_from_docx(file_bytes_io):
+    try:
+        with zipfile.ZipFile(file_bytes_io) as docx:
+            xml_content = docx.read('word/document.xml')
+            tree = ET.fromstring(xml_content)
+            namespaces = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+            texts = [node.text for node in tree.iterfind('.//w:t', namespaces) if node.text]
+            return "\n".join(texts)
+    except Exception:
+        return "[Chyba při čtení Word dokumentu]"
+
+def prepare_file_payload(uploaded_file):
+    if not uploaded_file:
+        return None, ""
+    
+    fname = uploaded_file.name.lower()
+    fbytes = uploaded_file.getvalue()
+    
+    # 1. Word dokument
+    if fname.endswith(".docx"):
+        extracted = extract_text_from_docx(io.BytesIO(fbytes))
+        return None, f"\n\n[OBSAH PŘILOŽENÉHO WORD DOKUMENTU ({uploaded_file.name})]:\n{extracted}\n"
+    
+    # 2. Textový soubor
+    elif fname.endswith(".txt") or fname.endswith(".csv") or fname.endswith(".md"):
+        try:
+            text_content = fbytes.decode("utf-8")
+        except Exception:
+            text_content = fbytes.decode("latin-1", errors="ignore")
+        return None, f"\n\n[OBSAH PŘILOŽENÉHO TEXTOVÉHO SOUBORU ({uploaded_file.name})]:\n{text_content}\n"
+    
+    # 3. PDF
+    elif fname.endswith(".pdf"):
+        b64 = base64.b64encode(fbytes).decode("utf-8")
+        return {"mime_type": "application/pdf", "data": b64}, f"\n[PŘILOŽENO PDF: {uploaded_file.name}]"
+    
+    # 4. Obrázky
+    elif fname.endswith(".png"):
+        b64 = base64.b64encode(fbytes).decode("utf-8")
+        return {"mime_type": "image/png", "data": b64}, f"\n[PŘILOŽEN OBRÁZEK: {uploaded_file.name}]"
+    elif fname.endswith(".jpg") or fname.endswith(".jpeg"):
+        b64 = base64.b64encode(fbytes).decode("utf-8")
+        return {"mime_type": "image/jpeg", "data": b64}, f"\n[PŘILOŽEN OBRÁZEK: {uploaded_file.name}]"
+    elif fname.endswith(".webp"):
+        b64 = base64.b64encode(fbytes).decode("utf-8")
+        return {"mime_type": "image/webp", "data": b64}, f"\n[PŘILOŽEN OBRÁZEK: {uploaded_file.name}]"
+        
+    return None, ""
+
+# =========================================================================
+# MULTIMODÁLNÍ VOLÁNÍ AI S DYNAMICKOU DETEKCÍ MODELŮ
+# =========================================================================
+def call_ai_multimodal(prompt_text, inline_attachment=None):
     key = api_key.strip()
     
+    # 1. GROQ
     if key.startswith("gsk_"):
         st.session_state.aktivni_model_nazev = "Groq Llama-3"
         res = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt_text}], "temperature": 0.3},
-            timeout=30
-        )
-        data = res.json()
-        if "choices" in data:
-            return data["choices"][0]["message"]["content"]
-        raise Exception(f"Groq API chyba: {data}")
+            timeout=35
+        ).json()
+        if "choices" in res:
+            return res["choices"][0]["message"]["content"]
+        raise Exception(f"Groq API chyba: {res}")
 
+    # 2. OPENAI
     elif key.startswith("sk-") and not key.startswith("sk-ant"):
         st.session_state.aktivni_model_nazev = "OpenAI GPT-4o"
         res = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt_text}], "temperature": 0.3},
-            timeout=30
-        )
-        data = res.json()
-        if "choices" in data:
-            return data["choices"][0]["message"]["content"]
-        raise Exception(f"OpenAI API chyba: {data}")
+            timeout=35
+        ).json()
+        if "choices" in res:
+            return res["choices"][0]["message"]["content"]
+        raise Exception(f"OpenAI API chyba: {res}")
 
+    # 3. GOOGLE GEMINI (Nativní PDF, obrázky i text)
     else:
         list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={key}"
         res_list = requests.get(list_url, timeout=15).json()
@@ -107,16 +170,26 @@ def call_ai_direct_rest(prompt_text):
 
         dostupne_modely.sort(key=lambda x: 0 if "flash" in x.lower() else (1 if "pro" in x.lower() else 2))
 
+        # Sestavení multimodálního parts payloadu
+        parts = [{"text": prompt_text}]
+        if inline_attachment:
+            parts.append({
+                "inline_data": {
+                    "mime_type": inline_attachment["mime_type"],
+                    "data": inline_attachment["data"]
+                }
+            })
+
         posledni_err = None
         for m_name in dostupne_modely:
             clean_m = m_name.replace("models/", "")
             endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_m}:generateContent?key={key}"
             payload = {
-                "contents": [{"parts": [{"text": prompt_text}]}],
+                "contents": [{"parts": parts}],
                 "generationConfig": {"temperature": 0.3}
             }
             try:
-                r = requests.post(endpoint, json=payload, headers={"Content-Type": "application/json"}, timeout=30)
+                r = requests.post(endpoint, json=payload, headers={"Content-Type": "application/json"}, timeout=40)
                 res_json = r.json()
                 
                 if "candidates" in res_json and len(res_json["candidates"]) > 0:
@@ -128,8 +201,11 @@ def call_ai_direct_rest(prompt_text):
                 posledni_err = str(e)
                 continue
 
-        raise Exception(f"Google API odmítlo všechny modely. Hlášení: {posledni_err}")
+        raise Exception(f"Google API odmítlo požadavek. Hlášení: {posledni_err}")
 
+# =========================================================================
+# STRUKTURA ZÁLOŽEK
+# =========================================================================
 tab_canvas, tab_mentor, tab_zakaznik, tab_krize = st.tabs([
     "🧩 1. Magický Lean Canvas", "🎓 2. Lean Mentor", "🗣️ 3. Simulátor zákazníka", "🌪️ 4. Generátor krizí"
 ])
@@ -161,77 +237,102 @@ with tab_canvas:
     with col7:
         st.markdown(f"<div class='canvas-block'><div class='canvas-title'>7. Zdroje Příjmů</div>{st.session_state.canvas['prijmy']}</div>", unsafe_allow_html=True)
 
-# ==================== TAB 2: MENTOR ====================
+# ==================== TAB 2: MENTOR (SOUBORY + ENTER) ====================
 with tab_mentor:
     st.subheader("Konzultace s Lean Startup Mentorem")
-    st.caption("Mentor analyzuje váš byznys model podle metodiky Lean Startup (Eric Ries, Steve Blank). Žádné prázdné fráze, ale věcná validace hypotéz.")
+    st.caption("Napište zprávu a stiskněte **Enter**. Volitelně můžete připojit soubor s podklady (PDF, Word, fotka skici/prototypu).")
     
+    with st.expander("📎 Připojit soubor k analýze (PDF, Word docx, fotka prototypu, text)", expanded=False):
+        uploaded_doc = st.file_uploader(
+            "Vyberte soubor k nahrání:",
+            type=["png", "jpg", "jpeg", "webp", "pdf", "docx", "txt", "csv", "md"],
+            key="mentor_file_uploader"
+        )
+        if uploaded_doc:
+            st.success(f"Připraven soubor: `{uploaded_doc.name}`")
+
+    st.divider()
+
     for msg in st.session_state.mentor_history:
         div_class = "chat-user" if msg["role"] == "user" else "chat-mentor"
-        st.markdown(f"<div class='{div_class}'><b>{'Vy' if msg['role']=='user' else 'Lean Mentor'}:</b><br>{msg['content']}</div>", unsafe_allow_html=True)
+        file_tag = f"<div class='file-badge'>📎 {msg['file']}</div><br>" if msg.get("file") else ""
+        st.markdown(f"<div class='{div_class}'><b>{'Vy' if msg['role']=='user' else 'Lean Mentor'}:</b><br>{file_tag}{msg['content']}</div>", unsafe_allow_html=True)
         
-    with st.form("form_mentor", clear_on_submit=True):
-        user_input = st.text_area("Popište svůj nápad, hypotézu nebo odpovězte mentorovi na předchozí otázky:")
-        if st.form_submit_button("Odeslat mentorovi", type="primary"):
-            if user_input.strip():
-                st.session_state.mentor_history.append({"role": "user", "content": user_input})
+    # Chat Input reaguje okamžitě na Enter
+    user_input = st.chat_input("Napište zprávu mentorovi a stiskněte Enter...")
+    
+    if user_input:
+        file_payload, extra_text_content = prepare_file_payload(uploaded_doc)
+        attached_name = uploaded_doc.name if uploaded_doc else None
+        
+        st.session_state.mentor_history.append({
+            "role": "user", 
+            "content": user_input,
+            "file": attached_name
+        })
+        
+        full_user_prompt = user_input + extra_text_content
+        
+        prompt = f"""
+        Jsi zkušený, konstruktivní a věcný Lean Startup mentor a akcelerátorový partner (metodika Eric Ries / Steve Blank / Y Combinator).
+        Mluvíš česky.
+
+        TVŮJ PŘÍSTUP:
+        1. Buď věcný, analytický, profesionální partner k diskusi.
+        2. Pokud zakladatel přiložil dokument, obrázek nebo výkres, detailně jej zanalyzuj a zohledni ve své odpovědi.
+        3. Rozuměj fázím vývoje: Pokud je projekt ve fázi MVP/pilotu, zaměř se na ověření u Early Adopters a první reálné testy.
+        4. Zhodnoť argumenty zakladatele, potvrď, co dává smysl, a polož 1-2 přesné diagnostické otázky k ověření rizik.
+
+        Aktuální stav Lean Canvasu: {json.dumps(st.session_state.canvas, ensure_ascii=False)}
+        Aktuální skóre validace (0-100): {st.session_state.validation_score}
+        Vstup od zakladatele: {full_user_prompt}
+
+        POKYN: Odpověz VÝHRADNĚ ve validním JSON formátu bez jakýchkoliv markdown značek okolo.
+        Struktura:
+        {{
+            "odpoved_mentora": "Strukturovaná, věcná zpětná vazba + 1-2 přesné otázky k ověření hypotézy.",
+            "nove_skore": [Číslo 0-100 podle toho, nakolik je model ujasněný a promyšlený],
+            "canvas_updaty": {{
+                "problem": "Stručný souhrn problému",
+                "reseni": "Stručný souhrn řešení / MVP",
+                "hodnota": "Unikátní hodnota (USP)",
+                "nefer_vyhoda": "Bariéra vstupu / nefér výhoda",
+                "cilovka": "Konkrétní Early Adopters",
+                "metriky": "Klíčové metriky úspěchu pilotu",
+                "kanaly": "Jak se dostat k nákupčímu",
+                "naklady": "Hlavní nákladové položky",
+                "prijmy": "Cenový model / monetizace"
+            }}
+        }}
+        """
+        
+        with st.spinner("Mentor analyzuje zprávu a přiložené podklady..."):
+            try:
+                raw_text = call_ai_multimodal(prompt, file_payload)
+                raw_text = re.sub(r'^```json\s*', '', raw_text)
+                raw_text = re.sub(r'\s*```$', '', raw_text)
                 
-                prompt = f"""
-                Jsi zkušený, konstruktivní a věcný Lean Startup mentor a akcelerátorový partner (metodika Eric Ries / Steve Blank / Y Combinator).
-                Mluvíš česky.
+                match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+                if match:
+                    ai_data = json.loads(match.group(0))
+                    st.session_state.mentor_history.append({
+                        "role": "mentor", 
+                        "content": ai_data.get("odpoved_mentora", "Rozumím."),
+                        "file": None
+                    })
+                    st.session_state.validation_score = ai_data.get("nove_skore", st.session_state.validation_score)
+                    
+                    new_canvas = ai_data.get("canvas_updaty", {})
+                    for k in st.session_state.canvas.keys():
+                        if k in new_canvas and new_canvas[k]: 
+                            st.session_state.canvas[k] = new_canvas[k]
+                else:
+                    st.session_state.mentor_history.append({"role": "mentor", "content": raw_text, "file": None})
+            except Exception as e:
+                st.session_state.mentor_history.append({"role": "mentor", "content": f"Chyba při zpracování: {str(e)}", "file": None})
+        st.rerun()
 
-                TVŮJ PŘÍSTUP:
-                1. Žádná agresivní klišé, žádné shazování zakladatele, žádné fráze jako "Probuďte se ze sna!".
-                2. Buď věcný, analytický, profesionální partner k diskusi.
-                3. Rozuměj fázím vývoje: Pokud má zakladatel funkční MVP k pilotáži, netlač ho do korporátních metrik pro 100 000 uživatelů. Soustřeď se na to, jak úspěšně spustit a vyhodnotit první pilotní testy (Early Adopters).
-                4. Zhodnoť argumenty zakladatele, potvrď, co dává smysl, a polož 1-2 přesné diagnostické otázky k ověření rizik (např. nákupní proces ve škole, zapojení učitelů, přesné odlišení od stávajících zvyklostí).
-
-                Aktuální stav Lean Canvasu: {json.dumps(st.session_state.canvas, ensure_ascii=False)}
-                Aktuální skóre validace (0-100): {st.session_state.validation_score}
-                Vstup od zakladatele: {user_input}
-
-                POKYN: Odpověz VÝHRADNĚ ve validním JSON formátu bez jakýchkoliv markdown značek okolo.
-                Struktura:
-                {{
-                    "odpoved_mentora": "Strukturovaná, věcná zpětná vazba + 1-2 přesné otázky k ověření hypotézy.",
-                    "nove_skore": [Číslo 0-100 podle toho, nakolik je model ujasněný a promyšlený],
-                    "canvas_updaty": {{
-                        "problem": "Stručný souhrn problému",
-                        "reseni": "Stručný souhrn řešení / MVP",
-                        "hodnota": "Unikátní hodnota (USP)",
-                        "nefer_vyhoda": "Bariéra vstupu / nefér výhoda",
-                        "cilovka": "Konkrétní Early Adopters",
-                        "metriky": "Klíčové metriky úspěchu pilotu",
-                        "kanaly": "Jak se dostat k nákupčímu",
-                        "naklady": "Hlavní nákladové položky",
-                        "prijmy": "Cenový model / monetizace"
-                    }}
-                }}
-                """
-                
-                with st.spinner("Mentor analyzuje byznys model..."):
-                    try:
-                        raw_text = call_ai_direct_rest(prompt)
-                        raw_text = re.sub(r'^```json\s*', '', raw_text)
-                        raw_text = re.sub(r'\s*```$', '', raw_text)
-                        
-                        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-                        if match:
-                            ai_data = json.loads(match.group(0))
-                            st.session_state.mentor_history.append({"role": "mentor", "content": ai_data.get("odpoved_mentora", "Rozumím.")})
-                            st.session_state.validation_score = ai_data.get("nove_skore", st.session_state.validation_score)
-                            
-                            new_canvas = ai_data.get("canvas_updaty", {})
-                            for k in st.session_state.canvas.keys():
-                                if k in new_canvas and new_canvas[k]: 
-                                    st.session_state.canvas[k] = new_canvas[k]
-                        else:
-                            st.session_state.mentor_history.append({"role": "mentor", "content": raw_text})
-                    except Exception as e:
-                        st.session_state.mentor_history.append({"role": "mentor", "content": f"Chyba při zpracování: {str(e)}"})
-                st.rerun()
-
-# ==================== TAB 3: ZÁKAZNÍK ====================
+# ==================== TAB 3: ZÁKAZNÍK (ENTER K ODESLÁNÍ) ====================
 with tab_zakaznik:
     st.subheader("Customer Discovery (Rozhovory nanečisto)")
     st.write("Otestujte svou hodnotovou nabídku na konkrétní personě zákazníka.")
@@ -247,26 +348,24 @@ with tab_zakaznik:
         div_class = "chat-user" if msg["role"] == "user" else "chat-mentor"
         st.markdown(f"<div class='{div_class}'><b>{'Vy' if msg['role']=='user' else 'Zákazník'}:</b><br>{msg['content']}</div>", unsafe_allow_html=True)
     
-    with st.form("form_customer", clear_on_submit=True):
-        cust_input = st.text_area("Oslovte zákazníka nebo mu položte otevřenou otázku pro ověření problému:")
-        if st.form_submit_button("Vést rozhovor", type="primary"):
-            if cust_input.strip():
-                st.session_state.customer_history.append({"role": "user", "content": cust_input})
-                
-                prompt_cust = f"""
-                Hraješ roli reálného potenciálního zákazníka. Tvé parametry: Věk {persona_vek}, Pozice: {persona_role}, Vlastnosti: {persona_zajem}.
-                Kontext projektu zakladatele: {json.dumps(st.session_state.canvas, ensure_ascii=False)}.
-                Mluvíš česky. Reaguj autenticky a realisticky podle své role. Zajímej se o to, co ti to ušetří, kolik času tě to bude stát a jak složité je to zavést.
+    cust_input = st.chat_input("Položte zákazníkovi otázku a stiskněte Enter...")
+    if cust_input:
+        st.session_state.customer_history.append({"role": "user", "content": cust_input})
+        
+        prompt_cust = f"""
+        Hraješ roli reálného potenciálního zákazníka. Tvé parametry: Věk {persona_vek}, Pozice: {persona_role}, Vlastnosti: {persona_zajem}.
+        Kontext projektu zakladatele: {json.dumps(st.session_state.canvas, ensure_ascii=False)}.
+        Mluvíš česky. Reaguj autenticky a realisticky podle své role. Zajímej se o to, co ti to ušetří, kolik času tě to bude stát a jak složité je to zavést.
 
-                Vstup od zakladatele: {cust_input}
-                """
-                with st.spinner("Zákazník formuluje odpověď..."):
-                    try:
-                        res_cust = call_ai_direct_rest(prompt_cust)
-                        st.session_state.customer_history.append({"role": "customer", "content": res_cust})
-                    except Exception as e:
-                        st.error(f"Chyba: {e}")
-                st.rerun()
+        Vstup od zakladatele: {cust_input}
+        """
+        with st.spinner("Zákazník formuluje odpověď..."):
+            try:
+                res_cust = call_ai_multimodal(prompt_cust)
+                st.session_state.customer_history.append({"role": "customer", "content": res_cust})
+            except Exception as e:
+                st.error(f"Chyba: {e}")
+        st.rerun()
 
 # ==================== TAB 4: KRIZE ====================
 with tab_krize:
@@ -281,7 +380,7 @@ with tab_krize:
         """
         with st.spinner("Generuji krizový scénář..."):
             try:
-                st.session_state.krize_aktivni = call_ai_direct_rest(prompt_krize)
+                st.session_state.krize_aktivni = call_ai_multimodal(prompt_krize)
             except Exception as e:
                 st.error(f"Chyba: {e}")
         st.rerun()
@@ -300,6 +399,6 @@ with tab_krize:
                     """
                     with st.spinner("Vyhodnocuji..."):
                         try:
-                            st.info(call_ai_direct_rest(prompt_reseni))
+                            st.info(call_ai_multimodal(prompt_reseni))
                         except Exception as e:
                             st.error(f"Chyba: {e}")
