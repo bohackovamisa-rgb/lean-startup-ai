@@ -70,7 +70,7 @@ if not api_key:
     st.stop()
 
 # =========================================================================
-# FUNKCE PRO EXTRAKCI TEXTU A PŘÍPRAVU PŘÍLOH
+# ZPRACOVÁNÍ LOKÁLNÍCH SOUBORŮ A GOOGLE DISKU
 # =========================================================================
 def extract_text_from_docx(file_bytes_io):
     try:
@@ -83,32 +83,84 @@ def extract_text_from_docx(file_bytes_io):
     except Exception:
         return "[Chyba při čtení Word dokumentu]"
 
-def prepare_file_payload(uploaded_file):
+def fetch_google_drive_content(url):
+    """Stáhne a analyzuje obsah ze sdíleného odkazu Google Disku / Dokumentů"""
+    if not url or not url.strip():
+        return None, "", None
+        
+    url = url.strip()
+    
+    # 1. Google Docs
+    doc_match = re.search(r'/document/d/([a-zA-Z0-9_-]+)', url)
+    if doc_match:
+        doc_id = doc_match.group(1)
+        export_url = f"https://docs.google.com/document/d/{doc_id}/export?format=txt"
+        try:
+            res = requests.get(export_url, timeout=15)
+            if res.status_code == 200:
+                return None, f"\n\n[OBSAH GOOGLE DOKUMENTU]:\n{res.text}\n", "Google Docs"
+        except Exception:
+            pass
+
+    # 2. Google Sheets
+    sheet_match = re.search(r'/spreadsheets/d/([a-zA-Z0-9_-]+)', url)
+    if sheet_match:
+        sheet_id = sheet_match.group(1)
+        export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+        try:
+            res = requests.get(export_url, timeout=15)
+            if res.status_code == 200:
+                return None, f"\n\n[OBSAH GOOGLE TABULKY]:\n{res.text}\n", "Google Tabulka"
+        except Exception:
+            pass
+
+    # 3. Přímý soubor na Google Drive (PDF / Obrázek / Docx)
+    drive_match = re.search(r'/file/d/([a-zA-Z0-9_-]+)', url) or re.search(r'id=([a-zA-Z0-9_-]+)', url)
+    if drive_match:
+        file_id = drive_match.group(1)
+        download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        try:
+            res = requests.get(download_url, timeout=20)
+            if res.status_code == 200:
+                content_type = res.headers.get('Content-Type', '').lower()
+                fbytes = res.content
+                if 'pdf' in content_type:
+                    b64 = base64.b64encode(fbytes).decode("utf-8")
+                    return {"mime_type": "application/pdf", "data": b64}, "\n[PŘILOŽENO PDF Z GOOGLE DISKU]", "Google Drive PDF"
+                elif any(img in content_type for img in ['image', 'png', 'jpeg', 'jpg', 'webp']):
+                    mime = "image/png" if "png" in content_type else "image/jpeg"
+                    b64 = base64.b64encode(fbytes).decode("utf-8")
+                    return {"mime_type": mime, "data": b64}, "\n[PŘILOŽEN OBRÁZEK Z GOOGLE DISKU]", "Google Drive Obrázek"
+                else:
+                    try:
+                        text = fbytes.decode("utf-8")
+                        return None, f"\n\n[OBSAH SOUBORU Z GOOGLE DISKU]:\n{text}\n", "Google Drive Soubor"
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+            
+    return None, f"\n[Nepodařilo se automaticky stáhnout obsah z odkazu. Ujistěte se, že má odkaz zapnuté veřejné sdílení 'Kdokoli má odkaz'.]", "Google Disk (Chyba přístupu)"
+
+def prepare_local_file_payload(uploaded_file):
     if not uploaded_file:
         return None, ""
     
     fname = uploaded_file.name.lower()
     fbytes = uploaded_file.getvalue()
     
-    # 1. Word dokument
     if fname.endswith(".docx"):
         extracted = extract_text_from_docx(io.BytesIO(fbytes))
         return None, f"\n\n[OBSAH PŘILOŽENÉHO WORD DOKUMENTU ({uploaded_file.name})]:\n{extracted}\n"
-    
-    # 2. Textový soubor
     elif fname.endswith(".txt") or fname.endswith(".csv") or fname.endswith(".md"):
         try:
             text_content = fbytes.decode("utf-8")
         except Exception:
             text_content = fbytes.decode("latin-1", errors="ignore")
         return None, f"\n\n[OBSAH PŘILOŽENÉHO TEXTOVÉHO SOUBORU ({uploaded_file.name})]:\n{text_content}\n"
-    
-    # 3. PDF
     elif fname.endswith(".pdf"):
         b64 = base64.b64encode(fbytes).decode("utf-8")
         return {"mime_type": "application/pdf", "data": b64}, f"\n[PŘILOŽENO PDF: {uploaded_file.name}]"
-    
-    # 4. Obrázky
     elif fname.endswith(".png"):
         b64 = base64.b64encode(fbytes).decode("utf-8")
         return {"mime_type": "image/png", "data": b64}, f"\n[PŘILOŽEN OBRÁZEK: {uploaded_file.name}]"
@@ -127,7 +179,6 @@ def prepare_file_payload(uploaded_file):
 def call_ai_multimodal(prompt_text, inline_attachment=None):
     key = api_key.strip()
     
-    # 1. GROQ
     if key.startswith("gsk_"):
         st.session_state.aktivni_model_nazev = "Groq Llama-3"
         res = requests.post(
@@ -140,7 +191,6 @@ def call_ai_multimodal(prompt_text, inline_attachment=None):
             return res["choices"][0]["message"]["content"]
         raise Exception(f"Groq API chyba: {res}")
 
-    # 2. OPENAI
     elif key.startswith("sk-") and not key.startswith("sk-ant"):
         st.session_state.aktivni_model_nazev = "OpenAI GPT-4o"
         res = requests.post(
@@ -153,7 +203,6 @@ def call_ai_multimodal(prompt_text, inline_attachment=None):
             return res["choices"][0]["message"]["content"]
         raise Exception(f"OpenAI API chyba: {res}")
 
-    # 3. GOOGLE GEMINI (Nativní PDF, obrázky i text)
     else:
         list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={key}"
         res_list = requests.get(list_url, timeout=15).json()
@@ -170,7 +219,6 @@ def call_ai_multimodal(prompt_text, inline_attachment=None):
 
         dostupne_modely.sort(key=lambda x: 0 if "flash" in x.lower() else (1 if "pro" in x.lower() else 2))
 
-        # Sestavení multimodálního parts payloadu
         parts = [{"text": prompt_text}]
         if inline_attachment:
             parts.append({
@@ -237,19 +285,30 @@ with tab_canvas:
     with col7:
         st.markdown(f"<div class='canvas-block'><div class='canvas-title'>7. Zdroje Příjmů</div>{st.session_state.canvas['prijmy']}</div>", unsafe_allow_html=True)
 
-# ==================== TAB 2: MENTOR (SOUBORY + ENTER) ====================
+# ==================== TAB 2: MENTOR (SOUBORY, DRIVE + ENTER) ====================
 with tab_mentor:
     st.subheader("Konzultace s Lean Startup Mentorem")
-    st.caption("Napište zprávu a stiskněte **Enter**. Volitelně můžete připojit soubor s podklady (PDF, Word, fotka skici/prototypu).")
+    st.caption("Napište zprávu a stiskněte **Enter**. Volitelně můžete připojit soubor z počítače nebo vložit odkaz na Google Disk / Docs.")
     
-    with st.expander("📎 Připojit soubor k analýze (PDF, Word docx, fotka prototypu, text)", expanded=False):
-        uploaded_doc = st.file_uploader(
-            "Vyberte soubor k nahrání:",
-            type=["png", "jpg", "jpeg", "webp", "pdf", "docx", "txt", "csv", "md"],
-            key="mentor_file_uploader"
-        )
+    with st.expander("📎 Připojit podklady (Google Disk, PDF, Word, obrázky)", expanded=False):
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            uploaded_doc = st.file_uploader(
+                "Nahrát z počítače:",
+                type=["png", "jpg", "jpeg", "webp", "pdf", "docx", "txt", "csv", "md"],
+                key="mentor_file_uploader"
+            )
+        with col_f2:
+            gdrive_link = st.text_input(
+                "Nebo vložte sdílený odkaz na Google Disk / Docs / Sheets:",
+                placeholder="https://docs.google.com/document/d/... nebo https://drive.google.com/...",
+                help="Ujistěte se, že odkaz má zapnuté sdílení 'Kdokoli má odkaz'."
+            )
+            
         if uploaded_doc:
             st.success(f"Připraven soubor: `{uploaded_doc.name}`")
+        if gdrive_link:
+            st.info("🔗 Zadaný odkaz na Google Disk bude analyzován při odeslání dotazu.")
 
     st.divider()
 
@@ -258,12 +317,21 @@ with tab_mentor:
         file_tag = f"<div class='file-badge'>📎 {msg['file']}</div><br>" if msg.get("file") else ""
         st.markdown(f"<div class='{div_class}'><b>{'Vy' if msg['role']=='user' else 'Lean Mentor'}:</b><br>{file_tag}{msg['content']}</div>", unsafe_allow_html=True)
         
-    # Chat Input reaguje okamžitě na Enter
     user_input = st.chat_input("Napište zprávu mentorovi a stiskněte Enter...")
     
     if user_input:
-        file_payload, extra_text_content = prepare_file_payload(uploaded_doc)
-        attached_name = uploaded_doc.name if uploaded_doc else None
+        file_payload = None
+        extra_text_content = ""
+        attached_name = None
+        
+        # Zpracování lokálního souboru
+        if uploaded_doc:
+            file_payload, extra_text_content = prepare_local_file_payload(uploaded_doc)
+            attached_name = uploaded_doc.name
+            
+        # Zpracování Google Disku (pokud nebyl nahrán lokální soubor)
+        elif gdrive_link:
+            file_payload, extra_text_content, attached_name = fetch_google_drive_content(gdrive_link)
         
         st.session_state.mentor_history.append({
             "role": "user", 
@@ -279,7 +347,7 @@ with tab_mentor:
 
         TVŮJ PŘÍSTUP:
         1. Buď věcný, analytický, profesionální partner k diskusi.
-        2. Pokud zakladatel přiložil dokument, obrázek nebo výkres, detailně jej zanalyzuj a zohledni ve své odpovědi.
+        2. Pokud zakladatel přiložil dokument, tabulku, výkres nebo podklad z Google Disku, detailně jej zanalyzuj a zohledni ve své odpovědi.
         3. Rozuměj fázím vývoje: Pokud je projekt ve fázi MVP/pilotu, zaměř se na ověření u Early Adopters a první reálné testy.
         4. Zhodnoť argumenty zakladatele, potvrď, co dává smysl, a polož 1-2 přesné diagnostické otázky k ověření rizik.
 
@@ -332,7 +400,7 @@ with tab_mentor:
                 st.session_state.mentor_history.append({"role": "mentor", "content": f"Chyba při zpracování: {str(e)}", "file": None})
         st.rerun()
 
-# ==================== TAB 3: ZÁKAZNÍK (ENTER K ODESLÁNÍ) ====================
+# ==================== TAB 3: ZÁKAZNÍK ====================
 with tab_zakaznik:
     st.subheader("Customer Discovery (Rozhovory nanečisto)")
     st.write("Otestujte svou hodnotovou nabídku na konkrétní personě zákazníka.")
