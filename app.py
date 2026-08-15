@@ -1,5 +1,4 @@
 import streamlit as st
-import google.generativeai as genai
 import json
 import re
 import requests
@@ -20,10 +19,10 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# Načtení API klíče ze Streamlit Secrets nebo vstupu
+# Načtení API klíče
 api_key = st.secrets.get("GEMINI_API_KEY", "") or st.secrets.get("AI_API_KEY", "")
 
-# Inicializace paměti
+# Inicializace stavu aplikace
 if "validation_score" not in st.session_state: st.session_state.validation_score = 0
 if "canvas" not in st.session_state: 
     st.session_state.canvas = {
@@ -33,14 +32,14 @@ if "canvas" not in st.session_state:
 if "mentor_history" not in st.session_state: st.session_state.mentor_history = []
 if "customer_history" not in st.session_state: st.session_state.customer_history = []
 if "krize_aktivni" not in st.session_state: st.session_state.krize_aktivni = None
-if "aktivni_model_nazev" not in st.session_state: st.session_state.aktivni_model_nazev = "Automatická volba"
+if "aktivni_model_nazev" not in st.session_state: st.session_state.aktivni_model_nazev = "Automatická detekce"
 
 with st.sidebar:
     st.title("🚀 Startup Hub")
     if not api_key:
-        api_key = st.text_input("Vložte API Key (Gemini, Groq nebo OpenAI):", type="password")
+        api_key = st.text_input("Vložte API Key:", type="password")
     
-    st.caption(f"Aktivní engine: `{st.session_state.aktivni_model_nazev}`")
+    st.caption(f"Aktivní model: `{st.session_state.aktivni_model_nazev}`")
     st.divider()
     st.markdown("### 📊 Validation Score")
     st.markdown(f"""
@@ -64,55 +63,81 @@ if not api_key:
     st.stop()
 
 # =========================================================================
-# UNIVERZÁLNÍ VOLÁNÍ AI S AUTOMATICKÝM FALLBACKEM
+# PŘÍMÉ REST VOLÁNÍ AI S AUTOMATICKÝM ZJIŠTĚNÍM AKTIVNÍCH MODELŮ
 # =========================================================================
-def call_ai_robust(prompt_text):
+def call_ai_direct_rest(prompt_text):
     key = api_key.strip()
     
-    # 1. VARIANTA: GROQ API (klíč začíná gsk_)
+    # 1. GROQ API (klíč začíná gsk_)
     if key.startswith("gsk_"):
-        st.session_state.aktivni_model_nazev = "Groq (Llama 3)"
+        st.session_state.aktivni_model_nazev = "Groq Llama-3"
         res = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt_text}], "temperature": 0.6}
-        ).json()
-        return res["choices"][0]["message"]["content"]
-        
-    # 2. VARIANTA: OPENAI API (klíč začíná sk-)
+            json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt_text}], "temperature": 0.5},
+            timeout=30
+        )
+        data = res.json()
+        if "choices" in data:
+            return data["choices"][0]["message"]["content"]
+        raise Exception(f"Groq API chyba: {data}")
+
+    # 2. OPENAI API (klíč začíná sk-)
     elif key.startswith("sk-") and not key.startswith("sk-ant"):
-        st.session_state.aktivni_model_nazev = "OpenAI (GPT-4o mini)"
+        st.session_state.aktivni_model_nazev = "OpenAI GPT-4o"
         res = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt_text}], "temperature": 0.6}
-        ).json()
-        return res["choices"][0]["message"]["content"]
+            json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt_text}], "temperature": 0.5},
+            timeout=30
+        )
+        data = res.json()
+        if "choices" in data:
+            return data["choices"][0]["message"]["content"]
+        raise Exception(f"OpenAI API chyba: {data}")
 
-    # 3. VARIANTA: GOOGLE GEMINI S ŘETĚZCEM ZÁLOŽNÍCH MODELŮ
+    # 3. GOOGLE GEMINI (DYNAMICKÉ ZJIŠTĚNÍ DOSTUPNÝCH MODELŮ PŘES REST)
     else:
-        genai.configure(api_key=key)
-        modely_k_vyzkouseni = [
-            "gemini-1.5-flash",
-            "gemini-2.0-flash",
-            "gemini-1.5-pro",
-            "gemini-1.5-flash-8b",
-            "gemini-pro"
-        ]
+        # Dotaz na Google pro seznam modelů dostupných pro tento klíč
+        list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={key}"
+        res_list = requests.get(list_url, timeout=15).json()
         
-        posledni_chyba = None
-        for m_name in modely_k_vyzkouseni:
+        dostupne_modely = []
+        if "models" in res_list:
+            dostupne_modely = [
+                m["name"] for m in res_list["models"] 
+                if "generateContent" in m.get("supportedGenerationMethods", [])
+            ]
+        
+        # Pokud se seznam nepodařilo načíst, použije se záložní seznam
+        if not dostupne_modely:
+            dostupne_modely = ["models/gemini-1.5-flash", "models/gemini-2.0-flash", "models/gemini-1.5-pro"]
+
+        # Seřazení: Flash má přednost před Pro kvůli rychlosti
+        dostupne_modely.sort(key=lambda x: 0 if "flash" in x.lower() else (1 if "pro" in x.lower() else 2))
+
+        posledni_err = None
+        for m_name in dostupne_modely:
+            clean_m = m_name.replace("models/", "")
+            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_m}:generateContent?key={key}"
+            payload = {
+                "contents": [{"parts": [{"text": prompt_text}]}],
+                "generationConfig": {"temperature": 0.4}
+            }
             try:
-                m = genai.GenerativeModel(m_name)
-                response = m.generate_content(prompt_text)
-                if response and response.text:
-                    st.session_state.aktivni_model_nazev = f"Gemini ({m_name})"
-                    return response.text
-            except Exception as err:
-                posledni_chyba = err
-                continue
+                r = requests.post(endpoint, json=payload, headers={"Content-Type": "application/json"}, timeout=30)
+                res_json = r.json()
                 
-        raise Exception(f"Všechny dostupné Gemini modely selhaly. Poslední chyba: {posledni_chyba}")
+                if "candidates" in res_json and len(res_json["candidates"]) > 0:
+                    st.session_state.aktivni_model_nazev = f"Gemini ({clean_m})"
+                    return res_json["candidates"][0]["content"]["parts"][0]["text"]
+                elif "error" in res_json:
+                    posledni_err = res_json["error"].get("message", "Neznámá chyba")
+            except Exception as e:
+                posledni_err = str(e)
+                continue
+
+        raise Exception(f"Google API odmítlo všechny modely. Hlášení: {posledni_err}")
 
 # =========================================================================
 # STRUKTURA ZÁLOŽEK
@@ -187,7 +212,7 @@ with tab_mentor:
                 
                 with st.spinner("Mentor analyzuje projekt a trh..."):
                     try:
-                        raw_text = call_ai_robust(prompt)
+                        raw_text = call_ai_direct_rest(prompt)
                         raw_text = re.sub(r'^```json\s*', '', raw_text)
                         raw_text = re.sub(r'\s*```$', '', raw_text)
                         
@@ -238,7 +263,7 @@ with tab_zakaznik:
                 """
                 with st.spinner("Zákazník reaguje..."):
                     try:
-                        res_cust = call_ai_robust(prompt_cust)
+                        res_cust = call_ai_direct_rest(prompt_cust)
                         st.session_state.customer_history.append({"role": "customer", "content": res_cust})
                     except Exception as e:
                         st.error(f"Chyba při komunikaci: {e}")
@@ -257,7 +282,7 @@ with tab_krize:
         """
         with st.spinner("Generuji krizový scénář..."):
             try:
-                st.session_state.krize_aktivni = call_ai_robust(prompt_krize)
+                st.session_state.krize_aktivni = call_ai_direct_rest(prompt_krize)
             except Exception as e:
                 st.error(f"Chyba: {e}")
         st.rerun()
@@ -276,6 +301,6 @@ with tab_krize:
                     """
                     with st.spinner("Vyhodnocuji..."):
                         try:
-                            st.info(call_ai_robust(prompt_reseni))
+                            st.info(call_ai_direct_rest(prompt_reseni))
                         except Exception as e:
                             st.error(f"Chyba: {e}")
