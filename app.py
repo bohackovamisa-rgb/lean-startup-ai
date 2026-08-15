@@ -19,9 +19,10 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# ==========================================
-# INICIALIZACE PAMĚTI
-# ==========================================
+# Automatické načtení klíče ze Streamlit Secrets
+api_key = st.secrets.get("GEMINI_API_KEY", "")
+
+# Inicializace stavu
 if "validation_score" not in st.session_state: st.session_state.validation_score = 0
 if "canvas" not in st.session_state: 
     st.session_state.canvas = {
@@ -32,13 +33,12 @@ if "mentor_history" not in st.session_state: st.session_state.mentor_history = [
 if "customer_history" not in st.session_state: st.session_state.customer_history = []
 if "krize_aktivni" not in st.session_state: st.session_state.krize_aktivni = None
 
-# ==========================================
-# LEVÉ MENU A API KLÍČ
-# ==========================================
 with st.sidebar:
-    st.title("⚙️ Nastavení AI")
-    api_key = st.text_input("Vložte Gemini API Key:", type="password", help="Získáte ho zdarma na aistudio.google.com")
-    st.caption("Klíč se nikam neukládá, slouží jen pro tuto relaci.")
+    st.title("🚀 Startup Hub")
+    if not api_key:
+        api_key = st.text_input("Vložte záložní Gemini API Key:", type="password")
+    else:
+        st.success("🤖 AI Engine: Aktivní a připraven")
     
     st.divider()
     st.markdown("### 📊 Validation Score")
@@ -59,7 +59,7 @@ with st.sidebar:
 st.title("🚀 AI Lean Startup Simulátor")
 
 if not api_key:
-    st.info("👈 Pro spuštění aplikace vložte váš bezplatný **Google Gemini API klíč** do postranního panelu vlevo a zmáčkněte Enter.")
+    st.warning("Systém nemá nastaven Gemini API klíč v Secrets. Zadejte jej v postranním panelu.")
     st.stop()
 
 # Připojení k AI
@@ -142,7 +142,6 @@ with tab_mentor:
                     try:
                         response = model.generate_content(prompt)
                         raw_text = response.text.strip()
-                        # Vyčištění textu pro jistotu, kdyby AI poslala markdown
                         raw_text = raw_text.replace("```json", "").replace("```", "").strip()
                         
                         ai_data = json.loads(raw_text)
