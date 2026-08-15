@@ -2,6 +2,7 @@ import streamlit as st
 import google.generativeai as genai
 import json
 import re
+import requests
 
 st.set_page_config(page_title="AI Lean Startup", page_icon="🚀", layout="wide")
 
@@ -19,8 +20,8 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# Načtení API klíče
-api_key = st.secrets.get("GEMINI_API_KEY", "")
+# Načtení API klíče ze Streamlit Secrets nebo vstupu
+api_key = st.secrets.get("GEMINI_API_KEY", "") or st.secrets.get("AI_API_KEY", "")
 
 # Inicializace paměti
 if "validation_score" not in st.session_state: st.session_state.validation_score = 0
@@ -32,12 +33,14 @@ if "canvas" not in st.session_state:
 if "mentor_history" not in st.session_state: st.session_state.mentor_history = []
 if "customer_history" not in st.session_state: st.session_state.customer_history = []
 if "krize_aktivni" not in st.session_state: st.session_state.krize_aktivni = None
+if "aktivni_model_nazev" not in st.session_state: st.session_state.aktivni_model_nazev = "Automatická volba"
 
 with st.sidebar:
     st.title("🚀 Startup Hub")
     if not api_key:
-        api_key = st.text_input("Vložte záložní Gemini API Key:", type="password")
+        api_key = st.text_input("Vložte API Key (Gemini, Groq nebo OpenAI):", type="password")
     
+    st.caption(f"Aktivní engine: `{st.session_state.aktivni_model_nazev}`")
     st.divider()
     st.markdown("### 📊 Validation Score")
     st.markdown(f"""
@@ -48,41 +51,79 @@ with st.sidebar:
     """, unsafe_allow_html=True)
     
     if st.session_state.validation_score == 0:
-        st.info("Představte svůj nápad mentorovi v záložce 2, aby mohl projekt ohodnotit.")
+        st.info("Představte svůj nápad mentorovi v záložce 2.")
     elif st.session_state.validation_score < 30:
-        st.error("Riziko krachu: Kritické! Běžte se ptát zákazníků (Záložka 3).")
+        st.error("Riziko krachu: Kritické! Ověřte hypotézy u zákazníků (Záložka 3).")
     elif st.session_state.validation_score > 80:
-        st.success("Tohle vypadá na Product-Market Fit! Skvělá práce.")
+        st.success("Product-Market Fit potvrzen!")
 
 st.title("🚀 AI Lean Startup Simulátor")
 
 if not api_key:
-    st.warning("Systém nemá nastaven Gemini API klíč v Secrets. Zadejte jej v postranním panelu.")
+    st.warning("Systém nemá nastaven API klíč. Zadejte jej v postranním panelu.")
     st.stop()
 
-# Automatická volba dostupného modelu
-try:
-    genai.configure(api_key=api_key)
-    dostupne_modely = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+# =========================================================================
+# UNIVERZÁLNÍ VOLÁNÍ AI S AUTOMATICKÝM FALLBACKEM
+# =========================================================================
+def call_ai_robust(prompt_text):
+    key = api_key.strip()
     
-    # Prioritní výběr: Flash -> Pro -> cokoliv dostupného
-    vybrany_model_nazev = next(
-        (m for m in dostupne_modely if "flash" in m.lower()),
-        next((m for m in dostupne_modely if "pro" in m.lower()), dostupne_modely[0] if dostupne_modely else "gemini-pro")
-    )
-    model = genai.GenerativeModel(vybrany_model_nazev)
-    st.sidebar.caption(f"Aktivní AI Model: `{vybrany_model_nazev.replace('models/', '')}`")
-except Exception as e:
-    st.error(f"Chyba při připojení k AI: {e}")
-    st.stop()
+    # 1. VARIANTA: GROQ API (klíč začíná gsk_)
+    if key.startswith("gsk_"):
+        st.session_state.aktivni_model_nazev = "Groq (Llama 3)"
+        res = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt_text}], "temperature": 0.6}
+        ).json()
+        return res["choices"][0]["message"]["content"]
+        
+    # 2. VARIANTA: OPENAI API (klíč začíná sk-)
+    elif key.startswith("sk-") and not key.startswith("sk-ant"):
+        st.session_state.aktivni_model_nazev = "OpenAI (GPT-4o mini)"
+        res = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt_text}], "temperature": 0.6}
+        ).json()
+        return res["choices"][0]["message"]["content"]
 
+    # 3. VARIANTA: GOOGLE GEMINI S ŘETĚZCEM ZÁLOŽNÍCH MODELŮ
+    else:
+        genai.configure(api_key=key)
+        modely_k_vyzkouseni = [
+            "gemini-1.5-flash",
+            "gemini-2.0-flash",
+            "gemini-1.5-pro",
+            "gemini-1.5-flash-8b",
+            "gemini-pro"
+        ]
+        
+        posledni_chyba = None
+        for m_name in modely_k_vyzkouseni:
+            try:
+                m = genai.GenerativeModel(m_name)
+                response = m.generate_content(prompt_text)
+                if response and response.text:
+                    st.session_state.aktivni_model_nazev = f"Gemini ({m_name})"
+                    return response.text
+            except Exception as err:
+                posledni_chyba = err
+                continue
+                
+        raise Exception(f"Všechny dostupné Gemini modely selhaly. Poslední chyba: {posledni_chyba}")
+
+# =========================================================================
+# STRUKTURA ZÁLOŽEK
+# =========================================================================
 tab_canvas, tab_mentor, tab_zakaznik, tab_krize = st.tabs([
     "🧩 1. Magický Lean Canvas", "🎓 2. Ďáblův advokát", "🗣️ 3. Simulátor zákazníka", "🌪️ 4. Generátor krizí"
 ])
 
 # ==================== TAB 1: LEAN CANVAS ====================
 with tab_canvas:
-    st.markdown("Tento plánovací nástroj se vyplňuje **zcela automaticky** na základě toho, jak váš projekt probíráte s AI Mentorem v záložce 2.")
+    st.markdown("Tento plánovací nástroj se vyplňuje **zcela automaticky** na základě rozhovoru s AI Mentorem v záložce 2.")
     
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
@@ -125,29 +166,28 @@ with tab_mentor:
                 prompt = f"""
                 Jsi přísný, drsný, ale spravedlivý byznys mentor typu 'Ďáblův advokát' (jako investoři v Shark Tank).
                 Mluvíš česky. Studenti ti představují startup. Najdi na trhu reálnou konkurenci a zeptej se jich na ni! 
-                Klaď nepříjemné otázky ohledně monetizace a toho, zda to zákazníci vůbec chtějí.
+                Klaď nepříjemné otázky ohledně monetizace, marží a toho, zda to zákazníci skutečně potřebují.
                 
                 Aktuální Lean Canvas: {json.dumps(st.session_state.canvas, ensure_ascii=False)}
                 Aktuální Skóre (0-100): {st.session_state.validation_score}
                 Zpráva od studenta: {user_input}
                 
-                POKYN: Odpověz VÝHRADNĚ v čistém formátu JSON! Nechci žádný jiný text před ani za JSONem.
-                Struktura JSONu:
+                POKYN: Odpověz VÝHRADNĚ ve validním JSON formátu bez jakéhokoliv dalšího textu okolo.
+                Struktura:
                 {{
                     "odpoved_mentora": "Tvá přísná odpověď...",
                     "nove_skore": 45,
                     "canvas_updaty": {{
-                        "problem": "krátký text", "reseni": "krátký text", "hodnota": "krátký text",
-                        "nefer_vyhoda": "krátký text", "cilovka": "krátký text", "metriky": "krátký text",
-                        "kanaly": "krátký text", "naklady": "krátký text", "prijmy": "krátký text"
+                        "problem": "stručně", "reseni": "stručně", "hodnota": "stručně",
+                        "nefer_vyhoda": "stručně", "cilovka": "stručně", "metriky": "stručně",
+                        "kanaly": "stručně", "naklady": "stručně", "prijmy": "stručně"
                     }}
                 }}
                 """
                 
-                with st.spinner("Mentor přemýšlí a analyzuje trh..."):
+                with st.spinner("Mentor analyzuje projekt a trh..."):
                     try:
-                        response = model.generate_content(prompt)
-                        raw_text = response.text.strip()
+                        raw_text = call_ai_robust(prompt)
                         raw_text = re.sub(r'^```json\s*', '', raw_text)
                         raw_text = re.sub(r'\s*```$', '', raw_text)
                         
@@ -164,7 +204,7 @@ with tab_mentor:
                         else:
                             st.session_state.mentor_history.append({"role": "mentor", "content": raw_text})
                     except Exception as e:
-                        st.session_state.mentor_history.append({"role": "mentor", "content": f"Omlouvám se, něco se pokazilo. Zkus to napsat znovu. (Technická chyba: {str(e)})"})
+                        st.session_state.mentor_history.append({"role": "mentor", "content": f"Omlouvám se, došlo k chybě: {str(e)}"})
                 st.rerun()
 
 # ==================== TAB 3: ZÁKAZNÍK ====================
@@ -191,36 +231,36 @@ with tab_zakaznik:
                 
                 prompt_cust = f"""
                 Hraješ roli cílového zákazníka. Tvé vlastnosti: Věk {persona_vek}, Povolání: {persona_role}, Charakter: {persona_zajem}.
-                Studenti se ti snaží vnutit svůj produkt (Jejich aktuální Canvas: {json.dumps(st.session_state.canvas)}).
-                Mluvíš česky. Odpovídej přesně z pohledu této persony! Používej adekvátní slang nebo styl mluvy. Pokud produktu nerozumíš, buď zmatený/á. Nesouhlas hned se vším.
+                Studenti se ti snaží vnutit svůj produkt (Jejich aktuální Canvas: {json.dumps(st.session_state.canvas, ensure_ascii=False)}).
+                Mluvíš česky. Odpovídej přesně z pohledu této persony! Používej adekvátní styl mluvy. Pokud produktu nerozumíš, buď zmatený/á. Nesouhlas hned se vším.
                 
                 Zpráva od studenta: {cust_input}
                 """
-                with st.spinner("Zákazník poslouchá..."):
+                with st.spinner("Zákazník reaguje..."):
                     try:
-                        response_cust = model.generate_content(prompt_cust)
-                        st.session_state.customer_history.append({"role": "customer", "content": response_cust.text})
-                    except:
-                        st.error("Chyba při komunikaci se zákazníkem.")
+                        res_cust = call_ai_robust(prompt_cust)
+                        st.session_state.customer_history.append({"role": "customer", "content": res_cust})
+                    except Exception as e:
+                        st.error(f"Chyba při komunikaci: {e}")
                 st.rerun()
 
 # ==================== TAB 4: KRIZE ====================
 with tab_krize:
     st.subheader("Black Swan (Krizový management)")
-    st.write("Skutečný byznys není procházka růžovým sadem. Kdykoliv může přijít událost, která vaši firmu zničí. Otestujte, jak umíte reagovat pod tlakem.")
+    st.write("Skutečný byznys není procházka růžovým sadem. Kdykoliv může přijít událost, která firmu ohrozí. Otestujte svou reakci pod tlakem.")
     
     if st.button("🚨 Vygenerovat nečekanou tržní krizi!", type="primary"):
         prompt_krize = f"""
         Podívej se na tento Lean Canvas startupu: {json.dumps(st.session_state.canvas, ensure_ascii=False)}.
-        Vymysli katastrofický, ale velmi realistický scénář (Black Swan událost), který právě tuto firmu potkal (např. vyhořel jim konkrétní dodavatel, stát zakázal jejich obor, konkurent je zažaloval).
-        Popiš krizovou situaci max 3 větami. Mluv česky. Na konci se zeptej týmu: "Jako CEO, jaký je tvůj první krok pro záchranu firmy?"
+        Vymysli katastrofický, ale velmi realistický scénář (Black Swan událost), který právě tuto firmu potkal (např. výpadek dodavatele, legislativní zákaz, žaloba konkurence).
+        Popiš krizovou situaci max 3 větami česky. Na konci se zeptej týmu: "Jako CEO, jaký je tvůj první krok pro záchranu firmy?"
         """
         with st.spinner("Generuji krizový scénář..."):
             try:
-                response_krize = model.generate_content(prompt_krize)
-                st.session_state.krize_aktivni = response_krize.text
-            except:
-                st.error("Nepodařilo se vygenerovat krizi.")
+                st.session_state.krize_aktivni = call_ai_robust(prompt_krize)
+            except Exception as e:
+                st.error(f"Chyba: {e}")
+        st.rerun()
         
     if st.session_state.krize_aktivni:
         st.markdown(f"<div class='crisis-box'>🔥 <b>MÁTE PROBLÉM:</b><br><br>{st.session_state.krize_aktivni}</div><br>", unsafe_allow_html=True)
@@ -231,12 +271,11 @@ with tab_krize:
                 if reseni.strip():
                     prompt_reseni = f"""
                     Student navrhl toto řešení krize: {reseni}.
-                    Krize byla tato: {st.session_state.krize_aktivni}.
-                    Zhodnoť to jako přísný krizový manažer. Fungovalo by to v realitě? Odpověz tvrdě, ale spravedlivě. A dej mu hodnocení 0-10 bodů.
+                    Krize byla: {st.session_state.krize_aktivni}.
+                    Zhodnoť to jako přísný krizový manažer. Fungovalo by to v realitě? Odpověz tvrdě, ale spravedlivě a uděl hodnocení 0-10 bodů.
                     """
-                    with st.spinner("Vyhodnocuji vaše řešení..."):
+                    with st.spinner("Vyhodnocuji..."):
                         try:
-                            response_res = model.generate_content(prompt_reseni)
-                            st.info(response_res.text)
-                        except:
-                            st.error("Chyba při vyhodnocování.")
+                            st.info(call_ai_robust(prompt_reseni))
+                        except Exception as e:
+                            st.error(f"Chyba: {e}")
